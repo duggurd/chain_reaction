@@ -1,0 +1,6 @@
+task_id: "task1"
+  type: "shell"
+  start_time: "2023-01-01"
+  schedule: "0 0 * * *"
+  code: "ls"
+banana:
