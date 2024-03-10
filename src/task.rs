@@ -1,8 +1,5 @@
 use std::process::ExitStatus;
 
-use crate::schedule::Schedule;
-use crate::unique_id::generate_unique_id;
-
 use tokio::time::Duration;
 use tokio::time::Instant;
 use tokio::process::{Command};
@@ -13,7 +10,6 @@ pub struct Task {
     // pub task_id: String,
     // pub(crate) schedule: Schedule,
     pub interval: Duration,
-    unique_id: u64,
     // pub start_time: DateTime<Local>,
     pub next_exec: Instant,
     cmd: String
@@ -27,7 +23,6 @@ impl Task {
             interval: interval,
             cmd: cmd,
             next_exec: Instant::now() + interval,
-            unique_id: generate_unique_id()
         }
     }
 
@@ -118,7 +113,7 @@ impl Task {
 
 impl PartialEq for Task {
     fn eq(&self, other: &Self) -> bool {
-        self.unique_id == other.unique_id
+        self.cmd == other.cmd
     }
     fn ne(&self, other: &Self) -> bool {
         !self.eq(other)

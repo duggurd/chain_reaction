@@ -36,3 +36,21 @@ Not sure how to handle rust code? Either add compiled binary to a folder and alt
 ### Using dynlib
 
 Have main function that encapsulates main loop of program, then a dynlig linked library using libloader and cargo watch. Tasks are created in the library, problem is all tasks would need to be compiled when one is added. Then solution is recursive cargo projects with libloader, not ideal.
+
+
+# Tasks
+
+Tasks are stateless binaries, that can run for short periods of time or long periods of time.
+
+Manage lifecycle of task-binaries.
+
+
+# Questions
+
+Store binaries? 
+- How are binaries uploaded? 
+- Not built from source in scheduler at least
+
+Execute binaries?
+- Input context? ideally something similar to [AWS Lambda Rust Runtime](https://github.com/awslabs/aws-lambda-rust-runtime)
+- How and where to store context?
