@@ -1,120 +1,194 @@
+use std::borrow::BorrowMut;
 use std::collections::{BinaryHeap, HashMap};
-use std::fs::{read_dir, read_to_string};
-use std::io::Error;
-use log::{self, LevelFilter, error};
-use simple_logger::SimpleLogger;
-use tokio::time::{interval, Duration};
-use chrono::Local;
+use tokio::time::Duration;
+use tracing::{event, Level, span};
+use std::time::SystemTime;
 
-use std::sync::{Arc, Mutex};
+use crate::Result;
+use crate::{Task, TaskInstance, TaskId, ScheduleType};
 
-use crate::task::Task;
 
+pub struct Scheduler {
+    pub tasks: HashMap<TaskId, Task>,
+    pub task_q: BinaryHeap<TaskInstance>,
+    drain: Vec<TaskId>
+}
 
 
 impl Scheduler {
-    pub async fn new(poll_sec: Option<u64>, log_level: LevelFilter, address: Option<&str>) -> Self {
-        assert!(poll_sec.is_some_and(|p| p > 1));
 
-        SimpleLogger::new()
-            .with_level(log_level)
-            .env()
-            .init()
-            .unwrap();
-
-        let listener = TcpListener::bind(address.unwrap_or("127.0.0.0:9876")).await.expect("Failed to bind address");
-        
-        return Scheduler {
-            task_q: BinaryHeap::<Task>::new(),
-            poll_sec: poll_sec.unwrap_or(10),
-            tcp_listener: listener
-            // tasks_path: tasks_path.unwrap_or("/tasks".to_string())
-        } 
-    }
-
-    pub fn add_task(&mut self, task: Task) {
-        log::debug!("Adding task: {}, next scheduled run: {}", task.task_id, task.next_exec);
-
-        self.task_q.push(task);
-    }
-
-    fn poll(&mut self) {
-        
-        if ! self.task_q.is_empty() {
-
-            log::debug!("Polling, {} tasks in q", self.task_q.len());
-
-            while self.task_q
-                .peek()
-                .is_some_and(|x| x.next_exec <= Local::now()) {
-                
-                // Probably better to get a mut ref, execute and if successfull (and within retries) remove task from q
-                let next_task = self.task_q.pop().unwrap();
-                
-                log::info!("Executing: {}", next_task.task_id);
-                
-                //Check for error on exec
-                match next_task.execute() {
-                    Ok(()) => {}
-                    Err(err) => error!("Task: {} failed, with err: {}", &next_task.task_id, err)
-                }
-                
-                // Reschedule task
-                if next_task.schedule.duration.is_some() {
-                    log::debug!("Scheduling next run of task: {}", next_task.task_id);
-                    
-                    match next_task.calc_next_time() {
-                        Some(task) => {
-                            self.task_q.push(task);
-                        },
-
-                        _ => {}
-                    }
-                }    
-            }
-        } else {
-            log::debug!("poll skipped; no tasks in q");
+    pub fn new() -> Self {
+        Scheduler { 
+            tasks: HashMap::new(),
+            task_q: BinaryHeap::<TaskInstance>::new(),
+            drain: Vec::new()
         }
-       
     }
 
-    pub fn run(&mut self) {
-        log::info!("schedule started, {} tasks in q", {self.task_q.len()});
-        
-        // let interval = interval(Duration::from_secs(self.poll_sec));
+    /// Add new task and schedule task
+    pub async fn add_task(
+        &mut self, 
+        task: Task, 
+        start_time: SystemTime
+    ) -> Result<()> {
 
-        let task_q = Arc::new(HashMap::<Task> {
-            map: Mutex::new(self.task_q),
-        });
+        event!(Level::INFO, id=task.task_id, "add");
+        
+        match self.tasks.contains_key(&task.task_id) {
+            true => {
+                event!(Level::ERROR, id=task.task_id, "already_exists");
+                return Err(format!("task '{}' already exists", task.task_id).into())
+            },
+            false => {
+                event!(Level::INFO, id=task.task_id, "inserted");
+                
+                let task2 = task.clone();
+                let task3 = task.clone();
+                self.tasks.insert(task.task_id, task2);
+
+                self.schedule_task(task3, start_time, 0).await?;
+            }
+        }
+        
+        Ok(())
+    }
+
+    pub async fn schedule_task(
+        &mut self, 
+        task: Task, 
+        exec_at: SystemTime, 
+        retry_num: u16
+    ) -> Result<()> {
+        
+        let task2 = task.clone();
+        let task3 = task.clone();
+        
+        let ti = TaskInstance::new(
+            task2, 
+            exec_at, 
+            retry_num
+        );
+
+        let inst_id = ti.instance_id.clone();
+
+        self.task_q.push(
+          ti  
+        );
+
+        event!(Level::TRACE, id=task3.task_id, inst_id=inst_id, "scheduled");
+        
+        Ok(())
+    }
+
+    /// Exec tasks at top of schedule
+    /// Reschedule if config says so
+    /// Trigger down-stream tasks
+    /// Sleep until trigger of next task or until new task is added
+    async fn poll(&mut self) -> Result<()> {
+        let span = span!(Level::TRACE, "poll");
+        let _enter = span.enter();
+
+        tracing::trace!("polling");
+
+        while self.task_q.peek().is_some_and(|ti| ti.exec_at < SystemTime::now()) {
+            
+            
+            // Should never return None
+            let next_task = self.task_q.pop().unwrap();
+            event!(Level::INFO, id=next_task.task.task_id, inst_id=next_task.instance_id, "exec");
+          
+            match next_task.exec().await {
+                // reschedule if failed and less than retry, with backoff
+                false => {
+                    if next_task.retry_num >= next_task.task.retries {
+                        return Err("Task failed, no more retries".into());
+                    } else {
+                        self.schedule_task(
+                            next_task.task, 
+                            SystemTime::now() + Duration::from_secs(2*(next_task.retry_num+1) as u64), 
+                            next_task.retry_num + 1
+                        ).await?;
+                    }
+                },
+                true => {
+
+                    let mut drain = false;
+
+                    for (i, d) in self.drain.iter_mut().enumerate() {
+                        if d == &next_task.task.task_id {
+                            self.tasks.remove(d);
+                            self.drain.swap_remove(i);
+                            drain = false;
+                            break;
+                        }
+                    }
+
+                    if drain == false {
+                        match next_task.task.schedule {
+                            ScheduleType::DownStream(task_id) => {
+
+                                self.schedule_task(
+                                    self.tasks.get(&task_id).unwrap().to_owned(), 
+                                    SystemTime::now(), 
+                                    0
+                                ).await?;
+                            },
+                            ScheduleType::Interval(duration) => {
+                                self.schedule_task(
+                                    next_task.task.to_owned(), 
+                                    SystemTime::now() + duration, 
+                                    0
+                                ).await?;
+                            },
+            
+                            // Ran successfully, no reschedule
+                            ScheduleType::Once => ()
+                        }
+                    }
+                }
+            }
+        }
+
+        let sleep_dur = match self.task_q.peek() {
+            Some(t)  => {
+                t.exec_at.duration_since(SystemTime::now()).unwrap()
+            },
+            None => tokio::time::Duration::from_secs(2)
+        };
+
+        tokio::time::sleep(sleep_dur).await;
+
+        Ok(())
+    }
+
+
+    pub async fn run(&mut self) -> Result<()> {
+        tracing::trace!("starting scheduler");
         
         loop {
-            match self.tcp_listener.accept().await {
-                Ok((socket, _)) => {
-                    task_q = self.task_q.clone();
-                }
-
-            }
-            // other things to do on each cycle, for example refresh tasks every x run
-            
-            // interval.tick().await?;
-            self.poll();
-            std::thread::sleep(std::time::Duration::from_secs(self.poll_sec));
+            self.poll().await?;
         }
     }
 
-    // Check if any files have changed since last read time
-    // If so update
-    // fn read_tasks(self) -> Result<(), Error>{
-    //     let mut files =  read_dir(self.tasks_path)?;
-    //     let mut yaml_tasks = Vec::<String>::new();
-        
-    //     for fp in files {
-    //         yaml_tasks.push(
-    //             read_to_string(fp?.path())?
-    //         );
-    //     }
+    /// Drain task from schedule
+    /// Scheduled tasks continue to run 
+    /// If task fails runs until no more retries left
+    pub fn drain_task(&mut self, task_id: TaskId) -> Result<()> {
+        self.drain.push(task_id);
+        Ok(())
+    }
 
-    //     Ok(())
-        
-    // }
+    /// Immediately remove task from que and task map
+    /// This is an expensive operation
+    fn kill_task(&mut self, task_id: TaskId) -> Result<()> {
+        todo!();
+
+        // if !self.tasks.contains_key(&task_id) {
+        //     return Err("Task does not exist".into())
+        // } else {
+
+        // }
+
+        // Ok(())
+    }
 }

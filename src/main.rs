@@ -1,50 +1,43 @@
 use tokio::time::Duration;
+use std::{collections::BinaryHeap, time::SystemTime};
+use std::error::Error;
+use std::collections::HashMap;
+
+use tracing::{event, Level, span};
+
 
 mod task;
+mod scheduler;
+use task::{Task, TaskInstance, ScheduleType, TaskId};
+use scheduler::Scheduler;
 
-use std::sync::Mutex;
-use std::collections::BinaryHeap;
-use std::error::Error;
 
-use task::Task;
-
-struct Scheduler {
-    task_q: Mutex<BinaryHeap<Task>>
-}
+type Result<T> = std::result::Result<T, Box<dyn Error>>;
 
 
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn Error>>{    
-    let initial_task_q = BinaryHeap::<Task>::new();
+async fn main() -> Result<()> { 
 
-    let mut scheduler = Scheduler {
-        task_q: Mutex::new(initial_task_q)
-    };
+    let subscriber = tracing_subscriber::fmt()
+            .compact()
+            .with_max_level(Level::TRACE)
+            .finish();
 
-    scheduler.run().await;
+    tracing::subscriber::set_global_default(subscriber)?;
+  
+
+    let echo_task = Task::new(
+        "echo_task",
+        ScheduleType::Interval(std::time::Duration::from_secs(5)), 
+        "echo hello!", 
+        Some(0)
+    );
+
+    let mut scheduler = Scheduler::new();
+
+    scheduler.add_task(echo_task, SystemTime::now()).await?;
+
+    scheduler.run().await?;
       
     Ok(())
-}
-
-
-impl Scheduler {
-    async fn poll(&mut self) {
-        let mut guard = self.task_q.lock().unwrap();
-
-        match guard.pop() {
-            Some(t) => match t.exec().await {
-                Ok(a) => todo!(),
-                Err(e) => todo!(),
-            },
-            _ => {}
-        };
-
-        tokio::time::sleep(Duration::from_secs(2)).await;
-    }
-
-    async fn run(&mut self) {
-        loop {
-            self.poll();
-        }
-    }
 }
