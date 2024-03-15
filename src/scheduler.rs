@@ -1,13 +1,18 @@
-use std::borrow::BorrowMut;
 use std::collections::{BinaryHeap, HashMap};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::time::Duration;
 use tracing::{event, Level, span};
 use std::time::SystemTime;
+use tokio::sync::Mutex;
+use std::sync::Arc;
+
+use tokio::net::{TcpListener, TcpStream, ToSocketAddrs};
 
 use crate::Result;
-use crate::{Task, TaskInstance, TaskId, ScheduleType};
+use crate::task::{Task, TaskInstance, TaskId, ScheduleType};
 
 
+/// Schedules and manages lifecycle of [`Task`]s
 pub struct Scheduler {
     pub tasks: HashMap<TaskId, Task>,
     pub task_q: BinaryHeap<TaskInstance>,
@@ -15,8 +20,155 @@ pub struct Scheduler {
 }
 
 
+pub enum ClientCommand {
+    Add(Task),
+    List,
+    Drain(TaskId),
+    Kill(TaskId),
+    Noop
+}
+
+impl ClientCommand {
+    fn from_string(data: String) -> Result<Self> {
+        let mut parts = data.split(" ");
+
+        // Match initial command
+        match parts.next() {
+            Some(cmd) => {
+                match cmd.trim().to_uppercase().as_str() {
+                    "ADD" => {
+                        let task_id = match parts.next() {
+                            Some(id) => id,
+                            None => {
+                                return Err("no task_id provided".into());
+                            }
+                        };
+                        
+                        let schedule = match parts.next() {
+                            Some(part) => ScheduleType::from_str(part)?,
+                            None => {
+                                return Err("no schedule provided".into());
+                            }
+                        };
+
+                        let cmd = parts.next().ok_or("no cmd provided")?;
+
+                        let retries = parts.next().unwrap_or("0").parse()?;
+
+                        let task = Task::new(task_id, schedule, cmd, retries); 
+                        
+                        return Ok::<ClientCommand, _>(ClientCommand::Add(task))
+                    },
+                    "LIST" => { 
+                        todo!()
+
+                    },
+                    "DRAIN" => {
+                        todo!()
+                    },
+                    "KILL" => {
+                        todo!()
+                    },
+                    _ => Err::<&str, &str>("Invalid Command".into())
+                }
+            },
+            None => {
+                Err("No cmd provided".into())
+            }
+        }?;
+
+        Err("something".into())
+    }
+}
+
+
+struct Server {
+    listener: TcpListener,
+    scheduler: Arc<Mutex<Scheduler>>
+}
+
+impl Server {
+
+    async fn new<A>(address: A) -> Self 
+    where 
+        A: ToSocketAddrs,
+    {
+        Self { 
+            listener: TcpListener::bind(address)
+                .await
+                .unwrap(),
+            scheduler: Arc::new(Mutex::new(Scheduler::new()))
+        }
+    }
+    
+    async fn handle_request(&self, mut stream: TcpStream) {
+        
+        let sched = self.scheduler.clone();
+        tokio::spawn( async move {
+        
+            let mut buf = String::new();
+            stream.read_to_string(&mut buf).await.unwrap();
+
+            let command = match ClientCommand::from_string(buf) {
+                Ok(cmd) => {
+                    cmd 
+                }, 
+                Err(e) => {
+                    // stream.write(e.to_string().as_bytes()).await;
+                    ClientCommand::Noop
+                }
+            };
+
+            match command {
+                ClientCommand::Add(task) => {
+                    match sched.lock().await.add_task(task, SystemTime::now()).await {
+                        Ok(()) =>  {
+                            // stream.write(b"task successfully added").await;
+                        },
+                        Err(e) => {
+                            // stream.write(format!("failed to add task {}", e).as_bytes()).await;
+                            
+                        }
+                    }
+                },
+                
+                ClientCommand::Drain(_task_id) => {
+                    todo!();
+                },
+                ClientCommand::Kill(_task_id) => {
+                    todo!();
+                },
+                ClientCommand::List => {
+                    stream.write(
+                        format!("{:?}", sched.lock().await.tasks)
+                            .as_bytes()
+                    ).await.unwrap();
+                },
+
+                ClientCommand::Noop => {}
+            };
+        });
+       
+    }
+
+    async fn run(&mut self) -> Result<()> {
+
+        loop {
+            match self.listener.accept().await {
+                Ok(( stream, _addr)) => {
+                    self.handle_request(stream).await;
+                },
+                Err(e) => {}
+            }
+        }
+    }
+    
+}
+
+
 impl Scheduler {
 
+    /// Create new scheduler instance
     pub fn new() -> Self {
         Scheduler { 
             tasks: HashMap::new(),
@@ -53,6 +205,8 @@ impl Scheduler {
         Ok(())
     }
 
+    /// Actually schedule task
+    /// Creates a new [`TaskInstance`] and adds it to the queue
     pub async fn schedule_task(
         &mut self, 
         task: Task, 

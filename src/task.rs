@@ -9,6 +9,11 @@ use crate::Result;
 
 pub type TaskId = String;
 
+
+/// Describes how a task is scheduled:
+/// - `Interval`: task is executed every `Duration`
+/// - `DownStream` [`TaskId`]: task has a down-stream dependency, and that task is executed on completion
+/// - `Once`: task is scheduled and executed once (with retries)
 #[derive(Debug, Clone)]
 pub enum ScheduleType {
     Interval(Duration),
@@ -16,6 +21,8 @@ pub enum ScheduleType {
     Once
 }
 
+/// Task configuration
+/// Describes how to schedule and execute a task
 #[derive(Debug, Clone)]
 pub struct Task {
     pub schedule: ScheduleType,
@@ -25,11 +32,11 @@ pub struct Task {
 }
 
 
+/// Actual scheduled instance of a task
 #[derive(Debug, Clone)]
 pub struct TaskInstance {
     pub instance_id: String,
     pub task: Task,
-    // pub start_time: DateTime<Local>,
     pub exec_at: SystemTime,
     pub logs: String,
     pub retry_num: u16,
@@ -41,7 +48,7 @@ impl Task {
         task_id: &str,
         schedule: ScheduleType, 
         cmd: &str, 
-        retries: Option<u16>
+        retries: u16
     ) -> Self {
 
         // Validate configs
@@ -56,22 +63,27 @@ impl Task {
             task_id: task_id.to_string(), 
             schedule: schedule, 
             cmd: cmd.to_string(), 
-            retries: retries.unwrap_or_default(), 
+            retries: retries, 
         }
     }
 }
 
 impl TaskInstance {
-    pub fn new(task: Task, exec_at: std::time::SystemTime, retry_num: u16) -> Self {
+    /// Create a new [`TaskInstance`] instance
+    pub fn new(
+        task: Task, 
+        exec_at: SystemTime, 
+        retry_num: u16
+    ) -> Self {
         
         TaskInstance { 
             instance_id: format!(
                 "{}_{}", 
                 task.task_id, 
-                std::time::SystemTime::now()
-                    .duration_since(
-                        std::time::SystemTime::UNIX_EPOCH
-                    ).unwrap().as_secs()
+                SystemTime::now()
+                    .duration_since(SystemTime::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
                 ), 
             task: task, 
             exec_at: exec_at, 
@@ -81,14 +93,20 @@ impl TaskInstance {
         }
     }
 
+    /// Execute the task as described in task ([`Task`]).
     pub async fn exec(&self) -> bool {
-        event!(Level::TRACE, id=self.instance_id, cmd=self.task.cmd, "exec");
+        event!(
+            Level::TRACE, 
+            id=self.instance_id, 
+            cmd=self.task.cmd, 
+            "exec"
+        );
         
         let cmd = if cfg!(target_os = "windows") {
             Command::new("cmd")
                 .arg("/C")
                 .arg(&self.task.cmd)
-                .spawn()
+                .output().await
                 .unwrap()
 
         } else {
@@ -96,23 +114,25 @@ impl TaskInstance {
                 .arg("-c")
                 .arg(&self.task.cmd)
                 .arg("2>&1")
-                .spawn()
+                .output().await
                 .unwrap()
         };
 
-        let status = match cmd.wait_with_output().await {
-            Ok(s) => s,
-            Err(_e) => return false,
-        };
+        // cmd.
+
+        // let status = match cmd.wait_with_output().await {
+        //     Ok(s) => s,
+        //     Err(_e) => return false,
+        // };
       
-        match status.status.success() {
+        match cmd.status.success() {
             true => {
                 event!(Level::TRACE, id=self.instance_id, "success");  
                 return true
             },
             false => {
 
-                let err = String::from_utf8(status.stdout)
+                let err = String::from_utf8(cmd.stdout)
                     .expect("failed to unpack vec utf-8");
 
                 event!(Level::WARN, id=self.instance_id, err=err, "failed");
@@ -120,6 +140,57 @@ impl TaskInstance {
             }
         }
 
+    }
+}
+
+impl ScheduleType {
+    pub(crate) fn from_str(data: &str) -> Result<Self> {
+        
+        match data.trim() {
+            "once" => Ok(Self::Once),
+            
+            s => {
+                let mut parts = s.split(":");
+                
+                match parts.next() {
+                    Some(st) => {
+                        match st {
+                            "dstream" => {
+                                if let Some(s) = parts.next() {
+                                    return Ok(Self::DownStream(s.to_string()));
+                                } else {
+                                    return Err("no task_id provided".into());
+                                };
+                            },
+                            "interval" => {
+                                if let Some(d) = parts.next() {
+                                    let value: u64 = match d[0..d.len()-1].parse() {
+                                        Ok(n) => n,
+                                        Err(e) => return Err(e.into())
+                                    };
+
+                                    let duration = match d.chars().last().unwrap() {
+                                        'n' => {Duration::from_nanos(value)},
+                                        's' => {Duration::from_secs(value)},
+                                        'm' => {Duration::from_secs(value*60)},
+                                        'h' => {Duration::from_secs(value*60*60)},
+                                        _ => {return Err("invalid time specifier".into())}
+                                    };
+
+                                    return Ok(Self::Interval(duration));
+
+                                } else {
+                                    return Err("invalid ScheduleType provided".into())
+                                }
+                            }
+                            _ => Err("incorrect scheduletype".into())
+                        }
+                    },
+
+                    None => return Err("invalid syntax for scheduletype".into())
+                }
+            }
+        }
     }
 }
 
