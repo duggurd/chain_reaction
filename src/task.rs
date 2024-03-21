@@ -37,6 +37,7 @@ pub struct TaskInstance {
     pub exec_at: SystemTime,
     pub logs: String,
     pub retry_num: u16,
+    #[allow(dead_code)]
     pub(crate) kill: bool,
 }
 
@@ -80,7 +81,7 @@ impl TaskInstance {
     }
 
     /// Execute the task as described in task ([`Task`]).
-    pub async fn exec(&self) -> bool {
+    pub async fn exec(&self) -> Result<()> {
         event!(
             Level::TRACE,
             id = self.instance_id,
@@ -105,29 +106,25 @@ impl TaskInstance {
                 .unwrap()
         };
 
-        // cmd.
-
-        // let status = match cmd.wait_with_output().await {
-        //     Ok(s) => s,
-        //     Err(_e) => return false,
-        // };
-
-        match cmd.status.success() {
+        match &cmd.status.success() {
             true => {
                 event!(Level::TRACE, id = self.instance_id, "success");
-                return true;
+                return Ok(());
             }
             false => {
-                let err = String::from_utf8(cmd.stdout).expect("failed to unpack vec utf-8");
+                let err: String =
+                    String::from_utf8(cmd.stdout).expect("failed to unpack vec utf-8");
 
                 event!(Level::WARN, id = self.instance_id, err = err, "failed");
-                return false;
+                return Err(err.into());
             }
         }
     }
 }
 
 impl ScheduleType {
+    const HELP: &'static str = "once | dstream:<task_id> | interval:<Xn|s|m|h>";
+
     pub(crate) fn from_str(data: &str) -> Result<Self> {
         match data.trim() {
             "once" => Ok(Self::Once),
@@ -141,7 +138,9 @@ impl ScheduleType {
                             if let Some(s) = parts.next() {
                                 return Ok(Self::DownStream(s.to_string()));
                             } else {
-                                return Err("no task_id provided".into());
+                                return Err(
+                                    format!("no task_id provided\n{}", ScheduleType::HELP).into()
+                                );
                             };
                         }
                         "interval" => {
@@ -156,18 +155,31 @@ impl ScheduleType {
                                     's' => Duration::from_secs(value),
                                     'm' => Duration::from_secs(value * 60),
                                     'h' => Duration::from_secs(value * 60 * 60),
-                                    _ => return Err("invalid time specifier".into()),
+                                    _ => {
+                                        return Err(format!("invalid time specifier: {}", d).into())
+                                    }
                                 };
 
                                 return Ok(Self::Interval(duration));
                             } else {
-                                return Err("invalid ScheduleType provided".into());
+                                return Err(format!(
+                                    "invalid ScheduleType provided\n {}",
+                                    ScheduleType::HELP
+                                )
+                                .into());
                             }
                         }
-                        _ => Err("incorrect scheduletype".into()),
+                        _ => Err(
+                            format!("incorrect scheduletype: {}\n{}", st, ScheduleType::HELP)
+                                .into(),
+                        ),
                     },
 
-                    None => return Err("invalid syntax for scheduletype".into()),
+                    None => {
+                        return Err(
+                            format!("invalid syntax for command\n{}", ScheduleType::HELP).into(),
+                        )
+                    }
                 }
             }
         }
@@ -187,23 +199,12 @@ impl Eq for TaskInstance {}
 
 impl Ord for TaskInstance {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        match (&self.exec_at, &other.exec_at) {
-            (time1, time2) => {
-                time2.cmp(time1) // Reversing ordering of BHeap
-            }
-
-            _ => std::cmp::Ordering::Equal,
-        }
+        other.exec_at.cmp(&self.exec_at)
     }
 }
 
 impl PartialOrd for TaskInstance {
     fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
-        match (&self.exec_at, &other.exec_at) {
-            (time1, time2) => {
-                Some(time2.cmp(time1)) // Reversing ordering of BHeap
-            }
-            _ => None,
-        }
+        Some(other.exec_at.cmp(&self.exec_at))
     }
 }

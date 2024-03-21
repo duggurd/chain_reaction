@@ -3,8 +3,10 @@
 
 // use tracing::Level;
 
+pub mod command;
 mod errors;
 pub mod scheduler;
+pub mod server;
 pub mod task;
 // pub use task::{Task, TaskInstance, ScheduleType, TaskId};
 // use scheduler::Scheduler;

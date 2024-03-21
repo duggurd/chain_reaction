@@ -21,8 +21,8 @@ name = "chainz_server"
 path = "src/bin/server.rs"
 
 [[bin]]
-name = "chainz_client"
-path = "src/bin/client.rs"
+name = "chainz_cli"
+path = "src/bin/cli.rs"
 
 [workspace]
 members = ["src/bin/*", "src/lib.rs"]
